@@ -30,7 +30,7 @@ st.caption("Upload notes image(s) or a pre-made quiz image (or JSON), plus an AM
 try:
     # Azure
     AZURE_DI_ENDPOINT = st.secrets["AZURE_DI_ENDPOINT"]      # e.g., https://<your-di>.cognitiveservices.azure.com/
-    AZURE_API_KEY = st.secrets["AZURE_API_KEY"]
+    AZURE_API_KEY = st.secrets["AZURE_DI_API_KEY"]
 
     AZURE_OPENAI_ENDPOINT = st.secrets["AZURE_OPENAI_ENDPOINT"]  # e.g., https://<your-openai>.openai.azure.com/
     AZURE_OPENAI_API_VERSION = st.secrets.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
