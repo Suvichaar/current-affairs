@@ -22,7 +22,7 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🧠 Notes/Quiz OCR → GPT Structuring → AMP Web Story")
-st.caption("Upload notes image(s) or a pre-made quiz image (or JSON), plus an AMP HTML template → download timestamped final HTML. Also saves uploads to S3 and exports MCQs to CSV/Excel.")
+st.caption("Upload notes image(s) or a pre-made quiz image (or JSON), plus an AMP HTML template → download timestamped final HTML. Saves uploads to S3 and exports MCQs to CSV/Excel (6 per image).")
 
 # ===========================
 # Secrets / Config
@@ -30,7 +30,7 @@ st.caption("Upload notes image(s) or a pre-made quiz image (or JSON), plus an AM
 try:
     # Azure (OCR)
     AZURE_DI_ENDPOINT = st.secrets["AZURE_DI_ENDPOINT"]
-    AZURE_API_KEY     = st.secrets["AZURE_DI_API_KEY"]  # if you renamed to AZURE_DI_API_KEY, also update below
+    AZURE_API_KEY     = st.secrets["AZURE_DI_API_KEY"]  # rename in secrets.toml to avoid collisions
 
     # Azure OpenAI (GPT)
     AZURE_OPENAI_ENDPOINT     = st.secrets["AZURE_OPENAI_ENDPOINT"]
@@ -53,9 +53,9 @@ try:
     CDN_MEDIA_BASE   = st.secrets.get("CDN_MEDIA_BASE", CDN_HTML_BASE)
 
     # Artifact prefixes (JSON/CSV/XLSX/Placeholders)
-    QUIZ_JSON_PREFIX      = st.secrets.get("QUIZ_JSON_PREFIX", "quiz-json")
-    QUIZ_CSV_PREFIX       = st.secrets.get("QUIZ_CSV_PREFIX", "quiz-csv")
-    PLACEHOLDERS_PREFIX   = st.secrets.get("PLACEHOLDERS_PREFIX", "quiz-placeholders")
+    QUIZ_JSON_PREFIX    = st.secrets.get("QUIZ_JSON_PREFIX", "quiz-json")
+    QUIZ_CSV_PREFIX     = st.secrets.get("QUIZ_CSV_PREFIX", "quiz-csv")
+    PLACEHOLDERS_PREFIX = st.secrets.get("PLACEHOLDERS_PREFIX", "quiz-placeholders")
 except Exception:
     st.error("Missing secrets. Please set required Azure and AWS keys in .streamlit/secrets.toml")
     st.stop()
@@ -217,14 +217,13 @@ def ocr_extract(image_bytes: bytes) -> str:
                 lines.append(line.content)
     return "\n".join(lines).strip()
 
-def ocr_extract_many(images_bytes_list) -> str:
-    """OCR multiple images and concatenate with page separators."""
-    chunks = []
-    for idx, b in enumerate(images_bytes_list, start=1):
-        text = ocr_extract(b)
-        if text:
-            chunks.append(f"[[PAGE {idx}]]\n{text}")
-    return "\n\n".join(chunks).strip()
+def ocr_extract_each(files):
+    """Return list of (image_idx, text) after OCR for each uploaded file."""
+    out = []
+    for idx, f in enumerate(files, start=1):
+        txt = ocr_extract(f.getvalue())
+        out.append((idx, txt.strip()))
+    return out
 
 def gpt_ocr_text_to_questions(raw_text: str) -> dict:
     """Convert OCR text that already contains questions into structured questions JSON (pick 6)."""
@@ -271,6 +270,23 @@ def gpt_notes_to_questions(notes_text: str) -> dict:
     if len(q) > 6:
         data["questions"] = q[:6]
     return data
+
+def build_per_image_question_sets(texts_by_image, mode: str):
+    """
+    texts_by_image: list of (image_idx, text)
+    mode: "notes" or "quiz"
+    Returns: [{"image_idx": int, "questions_data": {...}}, ...]
+    """
+    packs = []
+    for image_idx, txt in texts_by_image:
+        if not txt:
+            continue
+        if mode == "notes":
+            qd = gpt_notes_to_questions(txt)
+        else:
+            qd = gpt_ocr_text_to_questions(txt)
+        packs.append({"image_idx": image_idx, "questions_data": qd})
+    return packs
 
 def gpt_questions_to_placeholders(questions_data: dict) -> dict:
     """Map structured questions JSON into flat placeholder JSON for AMP template (uses first 5)."""
@@ -344,7 +360,7 @@ def upload_bytes_to_s3(data: bytes, key: str, content_type: str) -> str:
     )
     return f"{CDN_HTML_BASE.rstrip('/')}/{key}"
 
-def upload_images_to_s3(files) -> list:
+def upload_images_to_s3(files):
     """Upload a list of uploaded images to S3. Returns list of (key, cdn_url)."""
     ts_folder = datetime.now().strftime("%Y%m%d_%H%M%S")
     s3 = get_s3_client()
@@ -399,45 +415,38 @@ def upload_df_csv_xlsx_to_s3(df: pd.DataFrame, prefix: str, base_name: str) -> d
     )
     return urls
 
-# Convert questions JSON to DataFrame
-def questions_to_dataframe(questions_data: dict, source_urls: list) -> pd.DataFrame:
+# ---------- DataFrame builders ----------
+def questions_to_dataframe_multi(packs, image_urls):
+    """
+    Flatten all per-image question packs into one DataFrame (6 rows per image).
+    Adds columns: global_q_no, image_idx, image_url, q_no_in_image, question, options, correct, explanation.
+    """
     rows = []
-    qs = questions_data.get("questions", [])
-    for idx, q in enumerate(qs, start=1):
-        opts = q.get("options", {})
-        correct = q.get("correct_option", "")
-        correct_text = opts.get(correct, "")
-        rows.append({
-            "q_no": idx,
-            "question": q.get("question", ""),
-            "option_A": opts.get("A", ""),
-            "option_B": opts.get("B", ""),
-            "option_C": opts.get("C", ""),
-            "option_D": opts.get("D", ""),
-            "correct_option": correct,
-            "correct_text": correct_text,
-            "explanation": q.get("explanation", ""),
-            "source_images": ", ".join(source_urls) if source_urls else ""
-        })
+    global_no = 0
+    idx_to_url = {i+1: (image_urls[i] if i < len(image_urls) else "") for i in range(len(image_urls))}
+    for pack in sorted(packs, key=lambda x: x["image_idx"]):
+        img_idx = pack["image_idx"]
+        img_url = idx_to_url.get(img_idx, "")
+        qs = pack["questions_data"].get("questions", [])
+        for i, q in enumerate(qs, start=1):
+            global_no += 1
+            opts = q.get("options", {})
+            correct = q.get("correct_option", "")
+            rows.append({
+                "global_q_no": global_no,
+                "image_idx": img_idx,
+                "image_url": img_url,
+                "q_no_in_image": i,
+                "question": q.get("question", ""),
+                "option_A": opts.get("A", ""),
+                "option_B": opts.get("B", ""),
+                "option_C": opts.get("C", ""),
+                "option_D": opts.get("D", ""),
+                "correct_option": correct,
+                "correct_text": opts.get(correct, ""),
+                "explanation": q.get("explanation", "")
+            })
     return pd.DataFrame(rows)
-
-def df_download_buttons(df: pd.DataFrame, base_name: str = "mcqs_export"):
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download MCQs (CSV)",
-        data=csv_bytes,
-        file_name=f"{base_name}.csv",
-        mime="text/csv"
-    )
-    xlsx_buf = io.BytesIO()
-    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
-        df.to_excel(writer, sheet_name="MCQs", index=False)
-    st.download_button(
-        "⬇️ Download MCQs (Excel)",
-        data=xlsx_buf.getvalue(),
-        file_name=f"{base_name}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
 
 # ===========================
 # UI
@@ -461,9 +470,10 @@ with tab_all:
     up_tpl = st.file_uploader("📎 Upload AMP HTML template (.html)", type=["html", "htm"], key="tpl")
     show_debug = st.toggle("Show OCR / JSON previews", value=False)
 
-    questions_data = None
-    uploaded_image_urls = []  # CDN URLs of uploaded source images
+    uploaded_image_urls = []        # CDN URLs of uploaded source images
+    per_image_packs = []            # [{"image_idx": 1, "questions_data": {...}}, ...]
 
+    # ---------- Notes images mode ----------
     if mode == "Notes image(s) (OCR → generate quiz JSON)":
         up_imgs = st.file_uploader(
             "📎 Upload notes image(s) (JPG/PNG/WebP/TIFF) — multiple allowed",
@@ -492,26 +502,21 @@ with tab_all:
                                  caption=f"Notes page {i}", use_container_width=True)
                     except Exception:
                         pass
-            try:
-                with st.spinner("🔍 OCR (Azure Document Intelligence) on all pages…"):
-                    all_bytes = [f.getvalue() for f in up_imgs]
-                    notes_text = ocr_extract_many(all_bytes)
-                if not notes_text.strip():
-                    st.error("OCR returned empty text. Try clearer images.")
-                    st.stop()
-                if show_debug:
-                    with st.expander("📄 OCR Notes Text"):
-                        st.text(notes_text[:8000] if len(notes_text) > 8000 else notes_text)
 
-                with st.spinner("📝 Generating 6 MCQs from notes…"):
-                    questions_data = gpt_notes_to_questions(notes_text)
-                if show_debug:
-                    with st.expander("🧱 Generated Questions JSON (6 expected)"):
-                        st.code(json.dumps(questions_data, ensure_ascii=False, indent=2)[:12000], language="json")
+            try:
+                with st.spinner("🔍 OCR (per image)…"):
+                    texts_by_image = ocr_extract_each(up_imgs)  # [(idx, text), ...]
+                if not any(t for _, t in texts_by_image):
+                    st.error("OCR returned empty text for all images.")
+                    st.stop()
+
+                with st.spinner("📝 Generating 6 MCQs per image (notes)…"):
+                    per_image_packs = build_per_image_question_sets(texts_by_image, mode="notes")
             except Exception as e:
-                st.error(f"Failed to process notes → quiz JSON: {e}")
+                st.error(f"Failed to process notes → quizzes: {e}")
                 st.stop()
 
+    # ---------- Quiz images mode ----------
     elif mode == "Quiz image(s) (OCR → parse existing MCQs)":
         up_imgs = st.file_uploader(
             "📎 Upload quiz image(s) (JPG/PNG/WebP/TIFF) — multiple allowed",
@@ -540,31 +545,27 @@ with tab_all:
                                  caption=f"Quiz page {i}", use_container_width=True)
                     except Exception:
                         pass
-            try:
-                with st.spinner("🔍 OCR (Azure Document Intelligence)…"):
-                    all_bytes = [f.getvalue() for f in up_imgs]
-                    raw_text = ocr_extract_many(all_bytes)
-                if not raw_text.strip():
-                    st.error("OCR returned empty text. Try clearer images.")
-                    st.stop()
-                if show_debug:
-                    with st.expander("📄 OCR Text"):
-                        st.text(raw_text[:8000] if len(raw_text) > 8000 else raw_text)
 
-                with st.spinner("🤖 Parsing OCR into questions JSON…"):
-                    questions_data = gpt_ocr_text_to_questions(raw_text)
-                if show_debug:
-                    with st.expander("🧱 Structured Questions JSON (≤6)"):
-                        st.code(json.dumps(questions_data, ensure_ascii=False, indent=2)[:12000], language="json")
+            try:
+                with st.spinner("🔍 OCR (per image)…"):
+                    texts_by_image = ocr_extract_each(up_imgs)
+                if not any(t for _, t in texts_by_image):
+                    st.error("OCR returned empty text for all images.")
+                    st.stop()
+
+                with st.spinner("🤖 Parsing 6 MCQs per image (quiz)…"):
+                    per_image_packs = build_per_image_question_sets(texts_by_image, mode="quiz")
             except Exception as e:
-                st.error(f"Failed to process image(s) → JSON: {e}")
+                st.error(f"Failed to process quiz images → quizzes: {e}")
                 st.stop()
 
-    else:  # Structured JSON
+    # ---------- Structured JSON mode ----------
+    else:
         up_json = st.file_uploader("📎 Upload structured questions JSON", type=["json"], key="json")
         if up_json:
             try:
                 questions_data = json.loads(up_json.getvalue().decode("utf-8"))
+                per_image_packs = [{"image_idx": 1, "questions_data": questions_data}]
                 if show_debug:
                     with st.expander("🧱 Structured Questions JSON"):
                         st.code(json.dumps(questions_data, ensure_ascii=False, indent=2)[:12000], language="json")
@@ -573,44 +574,56 @@ with tab_all:
                 st.stop()
 
     # ===========================
-    # Export MCQs to CSV/Excel + S3
+    # Export MCQs (combined) + S3
     # ===========================
-    if questions_data:
+    if per_image_packs:
         try:
-            df = questions_to_dataframe(questions_data, uploaded_image_urls)
-            st.markdown("### 📊 MCQs Preview")
+            df = questions_to_dataframe_multi(per_image_packs, uploaded_image_urls)
+            st.markdown("### 📊 MCQs Preview (all images combined)")
             st.dataframe(df, use_container_width=True, hide_index=True)
 
             # Local downloads
             df_download_buttons(df, base_name=f"mcqs_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
-            # Upload JSON + CSV/XLSX to S3
+            # Upload per-image JSON (all packs) and combined CSV/XLSX to S3
             st.markdown("### ☁️ S3 artifacts")
-            json_url = upload_json_to_s3(questions_data, prefix=QUIZ_JSON_PREFIX, base_name="questions")
-            file_urls = upload_df_csv_xlsx_to_s3(df, prefix=QUIZ_CSV_PREFIX, base_name="mcqs")
+            combined_json = {"packs": per_image_packs}
+            json_url = upload_json_to_s3(combined_json, prefix=QUIZ_JSON_PREFIX, base_name="questions_all_images")
+            file_urls = upload_df_csv_xlsx_to_s3(df, prefix=QUIZ_CSV_PREFIX, base_name="mcqs_all_images")
 
             st.success("Uploaded quiz artifacts to S3")
-            st.write("**Questions JSON:**", json_url)
-            st.write("**CSV:**", file_urls["csv"])
-            st.write("**Excel:**", file_urls["xlsx"])
+            st.write("**All-Images Questions JSON:**", json_url)
+            st.write("**CSV (combined):**", file_urls["csv"])
+            st.write("**Excel (combined):**", file_urls["xlsx"])
 
         except Exception as e:
             st.warning(f"Could not build/upload CSV/Excel artifacts: {e}")
 
-    build = st.button("🛠️ Build final HTML", disabled=not (questions_data and up_tpl))
+    # ===========================
+    # Build AMP from one image's questions
+    # ===========================
+    selected_image_idx = None
+    if per_image_packs:
+        indices = [p["image_idx"] for p in sorted(per_image_packs, key=lambda x: x["image_idx"])]
+        selected_image_idx = st.selectbox("Choose image for AMP placeholders (first 5 Qs):", indices, index=0)
 
-    if build and questions_data and up_tpl:
+    build = st.button("🛠️ Build final HTML", disabled=not (per_image_packs and up_tpl and selected_image_idx is not None))
+
+    if build and per_image_packs and up_tpl and selected_image_idx is not None:
         try:
-            # → placeholders for AMP (first 5 Qs)
-            with st.spinner("🧩 Generating placeholders (first 5 Qs for template)…"):
-                placeholders = gpt_questions_to_placeholders(questions_data)
+            # pick the selected pack
+            pack = next(p for p in per_image_packs if p["image_idx"] == selected_image_idx)
+            questions_for_amp = pack["questions_data"]
+
+            with st.spinner("🧩 Generating placeholders (first 5 Qs)…"):
+                placeholders = gpt_questions_to_placeholders(questions_for_amp)
                 if show_debug:
                     with st.expander("🧩 Placeholder JSON"):
                         st.code(json.dumps(placeholders, ensure_ascii=False, indent=2)[:12000], language="json")
 
             # Optional: upload placeholders JSON for audit
             try:
-                placeholders_url = upload_json_to_s3(placeholders, prefix=PLACEHOLDERS_PREFIX, base_name="placeholders")
+                placeholders_url = upload_json_to_s3(placeholders, prefix=PLACEHOLDERS_PREFIX, base_name=f"placeholders_img{selected_image_idx}")
                 st.write("**Placeholders JSON (used for replacement):**", placeholders_url)
             except Exception as e:
                 st.warning(f"Could not upload placeholders JSON: {e}")
@@ -619,11 +632,9 @@ with tab_all:
             template_html = up_tpl.getvalue().decode("utf-8")
             final_html = fill_template(template_html, placeholders)
 
-            # save local
-            ts_name = f"final_quiz_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            # save local + upload
+            ts_name = f"final_quiz_img{selected_image_idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
             Path(ts_name).write_text(final_html, encoding="utf-8")
-
-            # upload to S3
             with st.spinner("☁️ Uploading final HTML to S3…"):
                 s3_key, cdn_url = upload_html_to_s3(final_html, ts_name)
 
@@ -654,5 +665,5 @@ with tab_all:
             st.info("AMP pages may not fully render inside Streamlit due to CSP/sandbox. For a faithful view, open in a real browser or the CDN URL.")
         except Exception as e:
             st.error(f"Build failed: {e}")
-    elif not (questions_data and up_tpl):
-        st.info("Upload an input (notes/quiz image(s) or JSON) **and** a template to enable the Build button.")
+    elif not (up_tpl and per_image_packs):
+        st.info("Upload images/JSON **and** a template to enable the Build button.")
