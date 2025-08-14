@@ -5,17 +5,17 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
-from streamlit.components.v1 import html as st_html  # <-- inline HTML viewer
+from streamlit.components.v1 import html as st_html  # inline HTML viewer
 from PIL import Image
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from openai import AzureOpenAI
-import boto3  # <-- S3 upload
-import pandas as pd  # <-- for CSV/Excel
+import boto3
+import pandas as pd  # CSV/Excel export
 
-# ---------------------------
+# ===========================
 # Streamlit page config
-# ---------------------------
+# ===========================
 st.set_page_config(
     page_title="Notes → OCR → Quiz → AMP",
     page_icon="🧠",
@@ -24,40 +24,45 @@ st.set_page_config(
 st.title("🧠 Notes/Quiz OCR → GPT Structuring → AMP Web Story")
 st.caption("Upload notes image(s) or a pre-made quiz image (or JSON), plus an AMP HTML template → download timestamped final HTML. Also saves uploads to S3 and exports MCQs to CSV/Excel.")
 
-# ---------------------------
-# Secrets / Config (from st.secrets)
-# ---------------------------
+# ===========================
+# Secrets / Config
+# ===========================
 try:
-    # Azure
-    AZURE_DI_ENDPOINT = st.secrets["AZURE_DI_ENDPOINT"]      # e.g., https://<your-di>.cognitiveservices.azure.com/
-    AZURE_API_KEY = st.secrets["AZURE_DI_API_KEY"]
+    # Azure (OCR)
+    AZURE_DI_ENDPOINT = st.secrets["AZURE_DI_ENDPOINT"]
+    AZURE_API_KEY     = st.secrets["AZURE_DI_API_KEY"]  # if you renamed to AZURE_DI_API_KEY, also update below
 
-    AZURE_OPENAI_ENDPOINT = st.secrets["AZURE_OPENAI_ENDPOINT"]  # e.g., https://<your-openai>.openai.azure.com/
-    AZURE_OPENAI_API_VERSION = st.secrets.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
-    AZURE_OPENAI_API_KEY = st.secrets.get("AZURE_OPENAI_API_KEY", AZURE_API_KEY)  # reuse if same key
-    GPT_DEPLOYMENT = st.secrets.get("GPT_DEPLOYMENT", "gpt-4")  # your deployment name
+    # Azure OpenAI (GPT)
+    AZURE_OPENAI_ENDPOINT     = st.secrets["AZURE_OPENAI_ENDPOINT"]
+    AZURE_OPENAI_API_VERSION  = st.secrets.get("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+    AZURE_OPENAI_API_KEY      = st.secrets.get("AZURE_OPENAI_API_KEY", AZURE_API_KEY)
+    GPT_DEPLOYMENT            = st.secrets.get("GPT_DEPLOYMENT", "gpt-4")
 
-    # AWS / S3 (must exist in secrets)
+    # AWS / S3
     AWS_ACCESS_KEY_ID     = st.secrets["AWS_ACCESS_KEY_ID"]
     AWS_SECRET_ACCESS_KEY = st.secrets["AWS_SECRET_ACCESS_KEY"]
     AWS_REGION            = st.secrets.get("AWS_REGION", "ap-south-1")
     AWS_BUCKET            = st.secrets.get("AWS_BUCKET", "suvichaarapp")
 
-    # HTML upload path + CDN
+    # Final HTML path + CDN
     HTML_S3_PREFIX = st.secrets.get("HTML_S3_PREFIX", "webstory-html")
     CDN_HTML_BASE  = st.secrets.get("CDN_HTML_BASE", "https://stories.suvichaar.org/")
 
-    # New: where to save uploaded note/quiz images
+    # Uploaded images path + CDN
     IMAGES_S3_PREFIX = st.secrets.get("IMAGES_S3_PREFIX", "notes-uploads")
-    # Optional: CDN base for media; fall back to HTML base if not provided
-    CDN_MEDIA_BASE  = st.secrets.get("CDN_MEDIA_BASE", CDN_HTML_BASE)
+    CDN_MEDIA_BASE   = st.secrets.get("CDN_MEDIA_BASE", CDN_HTML_BASE)
+
+    # Artifact prefixes (JSON/CSV/XLSX/Placeholders)
+    QUIZ_JSON_PREFIX      = st.secrets.get("QUIZ_JSON_PREFIX", "quiz-json")
+    QUIZ_CSV_PREFIX       = st.secrets.get("QUIZ_CSV_PREFIX", "quiz-csv")
+    PLACEHOLDERS_PREFIX   = st.secrets.get("PLACEHOLDERS_PREFIX", "quiz-placeholders")
 except Exception:
     st.error("Missing secrets. Please set required Azure and AWS keys in .streamlit/secrets.toml")
     st.stop()
 
-# ---------------------------
+# ===========================
 # Clients
-# ---------------------------
+# ===========================
 di_client = DocumentIntelligenceClient(
     endpoint=AZURE_DI_ENDPOINT,
     credential=AzureKeyCredential(AZURE_API_KEY)
@@ -77,9 +82,9 @@ def get_s3_client():
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
     )
 
-# ---------------------------
+# ===========================
 # Prompts
-# ---------------------------
+# ===========================
 SYSTEM_PROMPT_OCR_TO_QA = """
 You receive OCR text that already contains multiple-choice questions in Hindi or English.
 Each question has options (A)-(D), a single correct answer, and ideally an explanation.
@@ -175,18 +180,18 @@ Mapping rules:
 - sNoption1..4 ← options A..D text
 - For the correct option, set sNoptionKattr to the string "correct"; for others set "".
 - sNattachment1 ← explanation for that question
-- sNquestionHeading ← "Question {N-1}" (or language-appropriate: Hindi "प्रश्न {N-1}")
+- sNquestionHeading ← "Question {N-1}" (or language-appropriate equivalent)
 - pagetitle/storytitle: create short, relevant titles from the overall content.
-- typeofquiz: "Educational" (or "शैक्षिक" in Hindi) if unknown.
+- typeofquiz: "Educational" (or language-appropriate equivalent) if unknown.
 - s1title1: a 2–5 word intro title; s1text1: 1–2 sentence intro.
 - results_*: short friendly strings in the same language. results_bg_image: "" if none.
 
 Return only the JSON object.
 """.strip()
 
-# ---------------------------
+# ===========================
 # Helpers
-# ---------------------------
+# ===========================
 def clean_model_json(txt: str) -> str:
     """Remove code fences if model returns ```json ... ``` or ``` ... ```."""
     fenced = re.findall(r"```(?:json)?\s*(.*?)```", txt, flags=re.DOTALL)
@@ -239,7 +244,6 @@ def gpt_ocr_text_to_questions(raw_text: str) -> dict:
         if not m:
             raise
         data = json.loads(m.group(0))
-    # enforce 6 max
     q = data.get("questions", [])
     if len(q) > 6:
         data["questions"] = q[:6]
@@ -263,7 +267,6 @@ def gpt_notes_to_questions(notes_text: str) -> dict:
         if not m:
             raise
         data = json.loads(m.group(0))
-    # enforce exactly 6 (trim if more)
     q = data.get("questions", [])
     if len(q) > 6:
         data["questions"] = q[:6]
@@ -272,10 +275,7 @@ def gpt_notes_to_questions(notes_text: str) -> dict:
 def gpt_questions_to_placeholders(questions_data: dict) -> dict:
     """Map structured questions JSON into flat placeholder JSON for AMP template (uses first 5)."""
     q = questions_data.get("questions", [])
-    if len(q) > 5:
-        sub = {"questions": q[:5]}
-    else:
-        sub = {"questions": q}
+    sub = {"questions": q[:5]} if len(q) > 5 else {"questions": q}
     resp = gpt_client.chat.completions.create(
         model=GPT_DEPLOYMENT,
         temperature=0,
@@ -294,9 +294,7 @@ def gpt_questions_to_placeholders(questions_data: dict) -> dict:
         return json.loads(m.group(0))
 
 def build_attr_value(key: str, val: str) -> str:
-    """
-    s2option3attr + "correct" → "option-3-correct", else "" or passthrough.
-    """
+    """s2option3attr + 'correct' → 'option-3-correct', else passthrough/empty."""
     if not key.endswith("attr") or not val:
         return ""
     m = re.match(r"s(\d+)option(\d)attr$", key)
@@ -308,24 +306,18 @@ def fill_template(template: str, data: dict) -> str:
     """Replace {{key}} and {{key|safe}} using placeholder data, handling *attr keys specially."""
     rendered = {}
     for k, v in data.items():
-        if k.endswith("attr"):
-            rendered[k] = build_attr_value(k, str(v))
-        else:
-            rendered[k] = "" if v is None else str(v)
+        rendered[k] = build_attr_value(k, str(v)) if k.endswith("attr") else ("" if v is None else str(v))
     html = template
     for k, v in rendered.items():
         html = html.replace(f"{{{{{k}}}}}", v)
         html = html.replace(f"{{{{{k}|safe}}}}", v)
     return html
 
+# ---------- S3 helpers ----------
 def upload_html_to_s3(html_text: str, filename: str):
-    """
-    Upload HTML to S3 and return (s3_key, cdn_url).
-    No ACL is set (works with CloudFront + Origin Access).
-    """
+    """Upload HTML to S3 and return (s3_key, cdn_url)."""
     if not filename.lower().endswith(".html"):
         filename = f"{filename}.html"
-
     s3_key = f"{HTML_S3_PREFIX.strip('/')}/{filename}" if HTML_S3_PREFIX else filename
     s3 = get_s3_client()
     s3.put_object(
@@ -339,24 +331,33 @@ def upload_html_to_s3(html_text: str, filename: str):
     cdn_url = f"{CDN_HTML_BASE.rstrip('/')}/{s3_key}"
     return s3_key, cdn_url
 
+def upload_bytes_to_s3(data: bytes, key: str, content_type: str) -> str:
+    """Generic uploader; returns CDN URL."""
+    s3 = get_s3_client()
+    s3.put_object(
+        Bucket=AWS_BUCKET,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+        CacheControl="public, max-age=300",
+        ContentDisposition=f'inline; filename="{Path(key).name}"',
+    )
+    return f"{CDN_HTML_BASE.rstrip('/')}/{key}"
+
 def upload_images_to_s3(files) -> list:
-    """
-    Upload a list of uploaded images to S3.
-    Returns list of (key, cdn_url).
-    """
+    """Upload a list of uploaded images to S3. Returns list of (key, cdn_url)."""
     ts_folder = datetime.now().strftime("%Y%m%d_%H%M%S")
     s3 = get_s3_client()
     out = []
     for i, f in enumerate(files, start=1):
         raw = f.getvalue()
-        # Infer content-type
         ct = "image/jpeg"
         name_lower = f.name.lower()
         if name_lower.endswith(".png"):
             ct = "image/png"
         elif name_lower.endswith(".webp"):
             ct = "image/webp"
-        elif name_lower.endswith(".tif") or name_lower.endswith(".tiff"):
+        elif name_lower.endswith((".tif", ".tiff")):
             ct = "image/tiff"
 
         key = f"{IMAGES_S3_PREFIX.strip('/')}/{ts_folder}/{i:02d}_{Path(f.name).name}"
@@ -372,10 +373,34 @@ def upload_images_to_s3(files) -> list:
         out.append((key, url))
     return out
 
+def upload_json_to_s3(obj: dict, prefix: str, base_name: str) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    key = f"{prefix.strip('/')}/{base_name}_{ts}.json"
+    return upload_bytes_to_s3(json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"), key, "application/json")
+
+def upload_df_csv_xlsx_to_s3(df: pd.DataFrame, prefix: str, base_name: str) -> dict:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    urls = {}
+
+    # CSV
+    csv_key = f"{prefix.strip('/')}/{base_name}_{ts}.csv"
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    urls["csv"] = upload_bytes_to_s3(csv_bytes, csv_key, "text/csv")
+
+    # XLSX
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="MCQs", index=False)
+    xlsx_key = f"{prefix.strip('/')}/{base_name}_{ts}.xlsx"
+    urls["xlsx"] = upload_bytes_to_s3(
+        xlsx_buf.getvalue(),
+        xlsx_key,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    return urls
+
+# Convert questions JSON to DataFrame
 def questions_to_dataframe(questions_data: dict, source_urls: list) -> pd.DataFrame:
-    """
-    Convert questions JSON to a flat DataFrame with 6 rows (if available).
-    """
     rows = []
     qs = questions_data.get("questions", [])
     for idx, q in enumerate(qs, start=1):
@@ -404,20 +429,19 @@ def df_download_buttons(df: pd.DataFrame, base_name: str = "mcqs_export"):
         file_name=f"{base_name}.csv",
         mime="text/csv"
     )
-    # Excel
-    excel_buf = io.BytesIO()
-    with pd.ExcelWriter(excel_buf, engine="xlsxwriter") as writer:
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, sheet_name="MCQs", index=False)
     st.download_button(
         "⬇️ Download MCQs (Excel)",
-        data=excel_buf.getvalue(),
+        data=xlsx_buf.getvalue(),
         file_name=f"{base_name}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-# ---------------------------
-# 🧩 Builder UI
-# ---------------------------
+# ===========================
+# UI
+# ===========================
 tab_all, = st.tabs(["All-in-one Builder"])
 
 with tab_all:
@@ -438,7 +462,7 @@ with tab_all:
     show_debug = st.toggle("Show OCR / JSON previews", value=False)
 
     questions_data = None
-    uploaded_image_urls = []  # CDN URLs after upload
+    uploaded_image_urls = []  # CDN URLs of uploaded source images
 
     if mode == "Notes image(s) (OCR → generate quiz JSON)":
         up_imgs = st.file_uploader(
@@ -448,7 +472,6 @@ with tab_all:
             key="notes_imgs"
         )
         if up_imgs:
-            # 1) Save original images to S3 first (and collect URLs)
             try:
                 with st.spinner("☁️ Uploading source images to S3…"):
                     k_urls = upload_images_to_s3(up_imgs)
@@ -462,7 +485,6 @@ with tab_all:
                 st.error(f"Failed to upload images to S3: {e}")
                 st.stop()
 
-            # 2) OCR all images
             if show_debug:
                 for i, f in enumerate(up_imgs, start=1):
                     try:
@@ -481,7 +503,6 @@ with tab_all:
                     with st.expander("📄 OCR Notes Text"):
                         st.text(notes_text[:8000] if len(notes_text) > 8000 else notes_text)
 
-                # 3) Generate SIX MCQs
                 with st.spinner("📝 Generating 6 MCQs from notes…"):
                     questions_data = gpt_notes_to_questions(notes_text)
                 if show_debug:
@@ -499,7 +520,6 @@ with tab_all:
             key="quiz_imgs"
         )
         if up_imgs:
-            # 1) Save original images to S3
             try:
                 with st.spinner("☁️ Uploading source images to S3…"):
                     k_urls = upload_images_to_s3(up_imgs)
@@ -513,7 +533,6 @@ with tab_all:
                 st.error(f"Failed to upload images to S3: {e}")
                 st.stop()
 
-            # 2) OCR all images, concatenate
             if show_debug:
                 for i, f in enumerate(up_imgs, start=1):
                     try:
@@ -532,7 +551,6 @@ with tab_all:
                     with st.expander("📄 OCR Text"):
                         st.text(raw_text[:8000] if len(raw_text) > 8000 else raw_text)
 
-                # 3) Parse into up to SIX MCQs
                 with st.spinner("🤖 Parsing OCR into questions JSON…"):
                     questions_data = gpt_ocr_text_to_questions(raw_text)
                 if show_debug:
@@ -554,41 +572,59 @@ with tab_all:
                 st.error(f"Invalid JSON: {e}")
                 st.stop()
 
-    # ---------------------------
-    # Export MCQs to CSV/Excel (whenever we have questions_data)
-    # ---------------------------
+    # ===========================
+    # Export MCQs to CSV/Excel + S3
+    # ===========================
     if questions_data:
         try:
             df = questions_to_dataframe(questions_data, uploaded_image_urls)
             st.markdown("### 📊 MCQs Preview")
             st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # Local downloads
             df_download_buttons(df, base_name=f"mcqs_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+
+            # Upload JSON + CSV/XLSX to S3
+            st.markdown("### ☁️ S3 artifacts")
+            json_url = upload_json_to_s3(questions_data, prefix=QUIZ_JSON_PREFIX, base_name="questions")
+            file_urls = upload_df_csv_xlsx_to_s3(df, prefix=QUIZ_CSV_PREFIX, base_name="mcqs")
+
+            st.success("Uploaded quiz artifacts to S3")
+            st.write("**Questions JSON:**", json_url)
+            st.write("**CSV:**", file_urls["csv"])
+            st.write("**Excel:**", file_urls["xlsx"])
+
         except Exception as e:
-            st.warning(f"Could not build CSV/Excel view: {e}")
+            st.warning(f"Could not build/upload CSV/Excel artifacts: {e}")
 
     build = st.button("🛠️ Build final HTML", disabled=not (questions_data and up_tpl))
 
     if build and questions_data and up_tpl:
         try:
-            # → placeholders (first 5 only for AMP)
+            # → placeholders for AMP (first 5 Qs)
             with st.spinner("🧩 Generating placeholders (first 5 Qs for template)…"):
                 placeholders = gpt_questions_to_placeholders(questions_data)
                 if show_debug:
                     with st.expander("🧩 Placeholder JSON"):
                         st.code(json.dumps(placeholders, ensure_ascii=False, indent=2)[:12000], language="json")
 
-            # read template
-            template_html = up_tpl.getvalue().decode("utf-8")
+            # Optional: upload placeholders JSON for audit
+            try:
+                placeholders_url = upload_json_to_s3(placeholders, prefix=PLACEHOLDERS_PREFIX, base_name="placeholders")
+                st.write("**Placeholders JSON (used for replacement):**", placeholders_url)
+            except Exception as e:
+                st.warning(f"Could not upload placeholders JSON: {e}")
 
-            # merge
+            # merge into HTML
+            template_html = up_tpl.getvalue().decode("utf-8")
             final_html = fill_template(template_html, placeholders)
 
-            # save timestamped file locally
+            # save local
             ts_name = f"final_quiz_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
             Path(ts_name).write_text(final_html, encoding="utf-8")
 
-            # upload to S3 (NO ACL)
-            with st.spinner("☁️ Uploading to S3…"):
+            # upload to S3
+            with st.spinner("☁️ Uploading final HTML to S3…"):
                 s3_key, cdn_url = upload_html_to_s3(final_html, ts_name)
 
             st.success(f"✅ Final HTML generated and uploaded to S3: s3://{AWS_BUCKET}/{s3_key}")
@@ -604,13 +640,10 @@ with tab_all:
                 mime="text/html"
             )
 
-            # ---------------------------
-            # 👀 Live HTML Viewer (inline)
-            # ---------------------------
+            # Inline preview (AMP may be limited in sandbox)
             st.markdown("### 👀 Live HTML Preview")
             h = st.slider("Preview height (px)", min_value=400, max_value=1600, value=900, step=50)
-            full_width = st.checkbox("Force full viewport width (100vw)", value=True,
-                                     help="Overrides container width so the preview stretches edge-to-edge.")
+            full_width = st.checkbox("Force full viewport width (100vw)", value=True)
             style = f"width: {'100vw' if full_width else '100%'}; height: {h}px; border: 0; margin: 0; padding: 0;"
             st_html(final_html, height=h, scrolling=True) if not full_width else st_html(
                 f'<div style="position:relative;left:50%;right:50%;margin-left:-50vw;margin-right:-50vw;{style}">{final_html}</div>',
