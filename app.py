@@ -415,38 +415,72 @@ def upload_df_csv_xlsx_to_s3(df: pd.DataFrame, prefix: str, base_name: str) -> d
     )
     return urls
 
-# ---------- DataFrame builders ----------
-def questions_to_dataframe_multi(packs, image_urls):
+# ---------- Wide DataFrame builder (exact columns you requested) ----------
+def questions_to_wide_dataframe(per_image_packs, image_urls, max_q=6) -> pd.DataFrame:
     """
-    Flatten all per-image question packs into one DataFrame (6 rows per image).
-    Adds columns: global_q_no, image_idx, image_url, q_no_in_image, question, options, correct, explanation.
+    Build one row per image with columns:
+    image_url,
+    question1, s1option1, s1option2, s1option3, s1option4, correct_option1, explaination1,
+    question2, s2option1, ..., correct_option2, explaination2,
+    ...
+    up to `max_q` (default 6).
     """
+    idx_to_url = {i + 1: (image_urls[i] if i < len(image_urls) else "") for i in range(len(image_urls))}
     rows = []
-    global_no = 0
-    idx_to_url = {i+1: (image_urls[i] if i < len(image_urls) else "") for i in range(len(image_urls))}
-    for pack in sorted(packs, key=lambda x: x["image_idx"]):
+
+    for pack in sorted(per_image_packs, key=lambda x: x["image_idx"]):
         img_idx = pack["image_idx"]
         img_url = idx_to_url.get(img_idx, "")
-        qs = pack["questions_data"].get("questions", [])
-        for i, q in enumerate(qs, start=1):
-            global_no += 1
-            opts = q.get("options", {})
-            correct = q.get("correct_option", "")
-            rows.append({
-                "global_q_no": global_no,
-                "image_idx": img_idx,
-                "image_url": img_url,
-                "q_no_in_image": i,
-                "question": q.get("question", ""),
-                "option_A": opts.get("A", ""),
-                "option_B": opts.get("B", ""),
-                "option_C": opts.get("C", ""),
-                "option_D": opts.get("D", ""),
-                "correct_option": correct,
-                "correct_text": opts.get(correct, ""),
-                "explanation": q.get("explanation", "")
-            })
-    return pd.DataFrame(rows)
+        qs = pack["questions_data"].get("questions", []) or []
+
+        row = {"image_url": img_url}
+
+        # Fill each question block
+        for qn in range(1, max_q + 1):
+            q = qs[qn - 1] if qn - 1 < len(qs) else {}
+            opts = q.get("options", {}) if q else {}
+            correct = (q.get("correct_option", "") if q else "").strip()
+
+            row[f"question{qn}"] = q.get("question", "") if q else ""
+            row[f"s{qn}option1"] = opts.get("A", "")
+            row[f"s{qn}option2"] = opts.get("B", "")
+            row[f"s{qn}option3"] = opts.get("C", "")
+            row[f"s{qn}option4"] = opts.get("D", "")
+            row[f"correct_option{qn}"] = correct
+            # keep user's requested spelling
+            row[f"explaination{qn}"] = q.get("explanation", "") if q else ""
+
+        rows.append(row)
+
+    # Column order exactly as requested
+    cols = ["image_url"]
+    for qn in range(1, max_q + 1):
+        cols += [
+            f"question{qn}",
+            f"s{qn}option1", f"s{qn}option2", f"s{qn}option3", f"s{qn}option4",
+            f"correct_option{qn}",
+            f"explaination{qn}",
+        ]
+    df = pd.DataFrame(rows, columns=cols)
+    return df
+
+def df_download_buttons(df: pd.DataFrame, base_name: str = "mcqs_export"):
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download MCQs (CSV)",
+        data=csv_bytes,
+        file_name=f"{base_name}.csv",
+        mime="text/csv"
+    )
+    xlsx_buf = io.BytesIO()
+    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="MCQs", index=False)
+    st.download_button(
+        "⬇️ Download MCQs (Excel)",
+        data=xlsx_buf.getvalue(),
+        file_name=f"{base_name}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 # ===========================
 # UI
@@ -574,30 +608,30 @@ with tab_all:
                 st.stop()
 
     # ===========================
-    # Export MCQs (combined) + S3
+    # Export MCQs (WIDE, one row per image) + S3
     # ===========================
     if per_image_packs:
         try:
-            df = questions_to_dataframe_multi(per_image_packs, uploaded_image_urls)
-            st.markdown("### 📊 MCQs Preview (all images combined)")
+            df = questions_to_wide_dataframe(per_image_packs, uploaded_image_urls, max_q=6)
+            st.markdown("### 📊 MCQs (one row per image, wide format)")
             st.dataframe(df, use_container_width=True, hide_index=True)
 
             # Local downloads
-            df_download_buttons(df, base_name=f"mcqs_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+            df_download_buttons(df, base_name=f"mcqs_wide_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
-            # Upload per-image JSON (all packs) and combined CSV/XLSX to S3
+            # Upload the wide CSV/XLSX + the raw JSON packs to S3
             st.markdown("### ☁️ S3 artifacts")
             combined_json = {"packs": per_image_packs}
             json_url = upload_json_to_s3(combined_json, prefix=QUIZ_JSON_PREFIX, base_name="questions_all_images")
-            file_urls = upload_df_csv_xlsx_to_s3(df, prefix=QUIZ_CSV_PREFIX, base_name="mcqs_all_images")
+            file_urls = upload_df_csv_xlsx_to_s3(df, prefix=QUIZ_CSV_PREFIX, base_name="mcqs_wide_all_images")
 
             st.success("Uploaded quiz artifacts to S3")
-            st.write("**All-Images Questions JSON:**", json_url)
-            st.write("**CSV (combined):**", file_urls["csv"])
-            st.write("**Excel (combined):**", file_urls["xlsx"])
+            st.write("**All-Images Questions JSON (raw):**", json_url)
+            st.write("**CSV (wide):**", file_urls["csv"])
+            st.write("**Excel (wide):**", file_urls["xlsx"])
 
         except Exception as e:
-            st.warning(f"Could not build/upload CSV/Excel artifacts: {e}")
+            st.warning(f"Could not build/upload wide CSV/Excel artifacts: {e}")
 
     # ===========================
     # Build AMP from one image's questions
